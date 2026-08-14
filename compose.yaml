@@ -1,0 +1,78 @@
+name: fc4-flags-api
+
+x-app-build: &app-build
+  context: .
+  target: dev
+
+networks:
+  fc4-net:
+    name: fc4-flags-net
+
+volumes:
+  db-data:
+    name: fc4-flags-db-data
+
+services:
+  db:
+    image: postgres:17.6-bookworm
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    networks:
+      - fc4-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  migrate:
+    build: *app-build
+    image: fc4-flags-api:dev
+    env_file:
+      - .env
+    command: ["npm", "run", "db:migrate"]
+    networks:
+      - fc4-net
+    depends_on:
+      db:
+        condition: service_healthy
+
+  app:
+    build: *app-build
+    image: fc4-flags-api:dev
+    env_file:
+      - .env
+    ports:
+      - "${PORT:-3000}:3000"
+    networks:
+      - fc4-net
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    develop:
+      watch:
+        - path: ./src
+          action: sync
+          target: /app/src
+        - path: package.json
+          action: rebuild
+
+  adminer:
+    image: adminer:4.8.1
+    restart: unless-stopped
+    ports:
+      - "${ADMINER_PORT:-8081}:8080"
+    networks:
+      - fc4-net
+    profiles:
+      - tools

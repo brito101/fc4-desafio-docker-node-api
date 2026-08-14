@@ -1,252 +1,156 @@
-Projeto: Full Cycle 4.0 — Docker e Containers
-Fase do projeto: Do Dev à Produção: Containerizando uma API Node.js
+# fc4-flags-api — Containerização (Do Dev à Produção)
 
-# Do Dev à Produção: Containerizando uma API Node.js
+Entrega do desafio **"Do Dev à Produção: Containerizando uma API Node.js"** da Full Cycle 4.0 (trilha Docker para Produção). O código da aplicação (`src/`, `package.json`, `package-lock.json`, `tsconfig.json`, migrações) não foi alterado — a entrega é puramente a camada de containers.
 
-## Descrição
+## Sobre a entrega
 
-Neste desafio você vai pegar uma aplicação Node.js + TypeScript funcional, porém sem nenhuma infraestrutura de containers, e entregar a containerização completa dela em dois ambientes: desenvolvimento e produção.
+A API de feature flags (Node.js + TypeScript + PostgreSQL) ganhou dois ambientes de container totalmente automatizados a partir de um único `Dockerfile` multi-stage. O ambiente de **desenvolvimento** roda a partir do código-fonte com `tsx watch`, hot-sync/rebuild via `docker compose watch` e um cliente de banco (Adminer) sob demanda. O ambiente de **produção** consome uma imagem já compilada, publicada multi-arch (amd64/arm64) no Docker Hub com SBOM e provenance assinados, rodando sobre uma base distroless sem shell nem gerenciador de pacotes.
 
-Cenário: você entrou em um time que mantém uma API de feature flags em produção, mas todo o fluxo de trabalho roda direto na máquina de cada desenvolvedor. Sua missão é construir do zero toda a camada de containers: um ambiente de desenvolvimento produtivo, com reload automático e ferramentas de apoio, e uma imagem de produção enxuta, segura e publicada no Docker Hub com metadados de supply chain, pronta para rodar via Docker Compose de produção.
+Em ambos os ambientes as migrações do banco (`dist/db/migrate.js` / `npm run db:migrate`) são aplicadas por um serviço `migrate` de execução única, orquestrado pelo Compose via `depends_on: condition: service_completed_successfully` — nenhum passo manual é necessário além de `cp .env.example .env` e o `up`.
 
-Os dois ambientes têm objetivos diferentes e isso deve se refletir nas suas decisões. O ambiente de desenvolvimento prioriza produtividade: feedback rápido, dependências completas, dados descartáveis. O ambiente de produção prioriza o mínimo: imagem pequena, superfície de ataque reduzida, rastreabilidade do que foi construído.
+## Imagem no Docker Hub
 
-A entrega é puramente de containerização: o código da aplicação não deve ser alterado. Ele serve de contexto e referência.
+- Repositório: <https://hub.docker.com/r/brito101/fc4-flags-api>
+- Pull: `docker pull brito101/fc4-flags-api:1.0.0`
+- Digest do manifest list (`1.0.0` e `latest` apontam para o mesmo digest):
+  `sha256:9b7941852323b72498d3bf24263806b65fe203d95f41de55d72d4ba1aa7f01a7`
+- Plataformas: `linux/amd64`, `linux/arm64`
 
-## Objetivo
+Comparação de tamanho (`docker image ls` após `docker pull`, plataforma `linux/amd64`):
 
-Entregar, em um repositório público no GitHub (fork do repositório base), o seguinte pacote:
+| Imagem                                 | Disk usage | Content size |
+| -------------------------------------- | ---------: | -----------: |
+| `fc4-flags-api:dev` (estágio dev)      |     ~455 MB |       ~106 MB |
+| `brito101/fc4-flags-api:1.0.0` (prod)  |     ~214 MB |        ~56 MB |
 
-- `Dockerfile` único multi-stage com os estágios `dev`, `build` e `production`
-- `.dockerignore`
-- `compose.yaml` do ambiente de desenvolvimento, com watch, healthchecks e profiles
-- `compose.prod.yaml` do ambiente de produção, consumindo a imagem publicada no Docker Hub
-- Imagem de produção publicada em repositório público no Docker Hub: multi-arch (amd64 e arm64), com SBOM e provenance, nas tags semver e `latest`
-- Relatório de vulnerabilidades do Docker Scout em `reports/`
-- `README.md` com instruções, evidências e comandos de validação
+A imagem de produção é cerca de **2x menor** que a de dev — sem devDependencies, sem TypeScript/tsx, sem toolchain de build e sobre uma base sem shell/gerenciador de pacotes, bem abaixo do limite de 350 MB exigido.
 
-## Contexto
+## Decisões técnicas
 
-### A aplicação existente
+### Imagem base de produção
 
-O repositório base contém uma API REST de feature flags em Node.js + TypeScript com persistência em PostgreSQL. Ela expõe um CRUD de flags em `/flags`, identificadas por uma chave única. Características relevantes para o desafio:
+Escolhida uma composição **distroless** (`gcr.io/distroless/cc-debian12:nonroot`, ~20 MB) com o binário oficial do Node.js copiado de `node:22.22.2-bookworm-slim` por cima (estágio `node-runtime`), em vez de usar diretamente as tags prontas `gcr.io/distroless/nodejs22-debian12`.
 
-- Porta configurável via variável de ambiente `PORT` (padrão 3000)
-- Conexão com o banco configurável via variáveis de ambiente (host, porta, usuário, senha e nome do database)
-- Endpoint `GET /health` que responde 200 quando a aplicação e a conexão com o banco estão saudáveis
-- Scripts npm: `dev` (execução com reload automático), `build` (compila o TypeScript para `dist/`), `start` (executa o código compilado) e `db:migrate` (aplica as migrações de banco; idempotente)
-- Tratamento de SIGTERM/SIGINT com encerramento gracioso
+Motivo: ao rodar `docker scout cves` contra a tag `nodejs22-debian12:nonroot`, o Node embutido nela (22.22.0) continha a CVE crítica **CVE-2025-55130** (corrigida em 22.22.2), e a tag distroless ainda não havia sido republicada com o patch. Como a imagem `cc-debian12` já fornece exatamente as bibliotecas dinâmicas de que o binário do Node depende (`libc`, `libstdc++`, `libgcc`, `libm`, `libdl`, `libpthread` — verificado com `ldd`), copiar o Node de uma tag oficial já patcheada resolve a CVE sem abrir mão da superfície mínima do distroless (sem shell, sem `apt`/`apk`, usuário não-root nativo).
 
-A aplicação não possui Dockerfile, compose, dockerignore ou qualquer arquivo de containerização. Esse vácuo é proposital: é exatamente o que você vai construir.
+**Alternativa considerada e descartada:** `node:22-alpine`. Prós: menor esforço (nenhuma montagem manual de binário), boa maturidade/documentação, `apk` disponível para depuração. Contras decisivos para este caso: (1) traz um shell e um gerenciador de pacotes completos na imagem final, ampliando a superfície de ataque que o desafio pede para minimizar; (2) a base Alpine tem seu próprio histórico de CVEs em `busybox`/`musl`/`openssl` que precisariam ser monitorados à parte; (3) o tamanho final (~180 MB só de base) fica mais próximo do limite de 350 MB do que a composição distroless usada (~20 MB de base). A composição distroless entrega superfície de ataque menor e imagem menor, ao custo de exigir o estágio extra `node-runtime` — trade-off considerado favorável para produção.
 
-As migrações não rodam sozinhas. A subida de cada ambiente, tanto de desenvolvimento quanto de produção, deve executá-las automaticamente, e a estratégia (script de inicialização, `command` no compose ou outro mecanismo) é decisão sua. O runner de migrações é compilado junto com a aplicação: após o build, ele está disponível em `dist/db/migrate.js`.
+### Estratégia de cache de build
 
-## Tecnologias obrigatórias
+- `RUN --mount=type=cache,target=/root/.npm` em todo `npm ci`, para os estágios `dev`, `build` e `prod-deps` — o cache do npm persiste entre builds mesmo quando a camada é invalidada, evitando novo download de pacotes da rede.
+- Estágio `base` compartilhado copia **apenas** `package.json` e `package-lock.json` antes de qualquer outra instrução. Como o restante do código (`COPY . .`) só acontece depois do `npm ci`, alterar um arquivo em `src/` nunca invalida a camada de instalação de dependências — só uma mudança no `package.json`/lockfile dispara reinstalação.
+- `prod-deps` roda `npm ci --omit=dev` isolado do estágio `build` (que precisa de `devDependencies` para compilar), então a imagem de produção nunca herda camadas com dependências de desenvolvimento.
+- O estágio `node-runtime` e o `base` ficam completamente desacoplados: o Buildx só refaz o download da imagem `node:22.22.2-bookworm-slim` se o `ARG NODE_RUNTIME_VERSION` mudar.
 
-- Docker Engine ou Docker Desktop em versão recente, com Compose v2 e Buildx
-- Buildx com builder capaz de build multi-plataforma (driver `docker-container` ou equivalente)
-- Em Docker Engine no Linux, emulação QEMU/binfmt instalada para o build arm64 (ex: `docker run --privileged --rm tonistiigi/binfmt --install arm64`); o Docker Desktop já traz a emulação embutida
-- Docker Scout (CLI ou via Docker Desktop)
-- Conta no Docker Hub com repositório público
+## Como rodar (desenvolvimento)
 
-É proibido alterar o código da aplicação (`src/`, `package.json`, `package-lock.json`, `tsconfig.json` e migrações). Arquivos novos de containerização, como scripts de inicialização, são permitidos.
-
-## Requisitos
-
-### 1. Dockerfile multi-stage
-
-Um único arquivo `Dockerfile` na raiz do projeto, com no mínimo os estágios nomeados `dev`, `build` e `production`.
-
-Regras que valem para o arquivo inteiro:
-
-- Nenhuma imagem base com tag `latest` ou sem tag: versões sempre fixadas
-- Instalações de dependências usando cache de build (`RUN --mount=type=cache` apontando para o diretório de cache do npm)
-- Ordem das instruções pensada para aproveitamento de cache entre builds (metadados de dependências copiados antes do restante do código)
-
-Estágio `dev`:
-
-- Instala todas as dependências, incluindo devDependencies
-- Usuário não-root e `WORKDIR` definidos
-- `CMD` executa a aplicação em modo desenvolvimento (script `dev`)
-
-Estágio `build`:
-
-- Compila o TypeScript (`npm run build`), gerando `dist/`
-
-Estágio `production`:
-
-- Parte de uma imagem base enxuta (a escolha é sua e deve ser justificada no README)
-- Contém apenas o código compilado e as dependências de produção
-- Usuário não-root
-- `HEALTHCHECK` declarado na própria imagem, validando o `GET /health`
-- `ENTRYPOINT`/`CMD` em exec form, garantindo que o processo Node receba sinais do sistema corretamente
-- Labels OCI: `org.opencontainers.image.title`, `org.opencontainers.image.description`, `org.opencontainers.image.version` e `org.opencontainers.image.source`
-
-### 2. Ambiente de desenvolvimento (compose.yaml)
-
-- Serviços `app` (build do estágio `dev`) e `db` (PostgreSQL com versão fixada), conectados por uma network nomeada declarada no arquivo
-- `db` com healthcheck e `app` dependendo dele com `condition: service_healthy`
-- Variáveis de ambiente carregadas de um arquivo `.env` (via `env_file` ou interpolação). O `.env.example` deve estar versionado com valores funcionais para a subida via compose, e o `.env` deve estar no `.gitignore`
-- Dados do PostgreSQL em volume nomeado
-- `develop.watch` configurado com, no mínimo: ação `sync` para mudanças em `src/` e ação `rebuild` para mudanças no `package.json`
-- Serviço `adminer` disponível em `http://localhost:8081`, ativado somente pelo profile `tools`
-- Migrações aplicadas automaticamente na subida do ambiente
-- Fluxo do avaliador: `cp .env.example .env` seguido de `docker compose up` deve deixar a API respondendo em `http://localhost:3000`, com `GET /flags` retornando 200, sem nenhum passo manual adicional
-
-### 3. Imagem de produção no Docker Hub
-
-- Build com `docker buildx build` a partir do estágio `production`
-- Manifest list contendo as plataformas `linux/amd64` e `linux/arm64`
-- Build com `--sbom=true` e `--provenance=true`, com as attestations publicadas junto da imagem
-- Publicada em repositório público no Docker Hub com uma tag semver (ex: `1.0.0`) e a tag `latest`, ambas apontando para o mesmo digest
-- Tamanho da imagem, reportado por `docker image ls` após `docker pull --platform linux/amd64`, menor ou igual a 350 MB
-
-### 4. Análise de vulnerabilidades (Docker Scout)
-
-- Executar `docker scout cves` contra a imagem publicada e salvar a saída completa em `reports/scout-cves.txt`
-- A imagem não pode conter nenhuma CVE de severidade CRITICAL com correção disponível (verificável com `docker scout cves --only-severity critical --only-fixed`)
-- CVEs de severidade HIGH, e CRITICAL sem correção disponível, se existirem, devem ser listadas no README com justificativa ou plano de mitigação
-
-### 5. Ambiente de produção (compose.prod.yaml)
-
-- Serviço `app` sem instrução `build`: usa a imagem publicada no Docker Hub, referenciada pela tag semver
-- Serviços `app` e `db` com restart policy (`always` ou `unless-stopped`) e limites explícitos de CPU e memória (serviços de execução única, como um eventual serviço de migração, ficam fora desta regra)
-- Nenhum bind mount de código-fonte; dados do PostgreSQL em volume nomeado
-- Mesmo esquema de variáveis de ambiente (`.env.example` → `.env`). Em produção real esses valores viriam de um gerenciador de segredos; aqui o `.env` existe para permitir a subida local pelo avaliador
-- Migrações aplicadas automaticamente na subida do ambiente
-- Healthchecks ativos: `docker compose -f compose.prod.yaml ps` deve exibir `app` e `db` como `healthy`
-- Fluxo do avaliador: `cp .env.example .env` seguido de `docker compose -f compose.prod.yaml up -d` deve deixar a API respondendo em `http://localhost:3000`, com `GET /flags` retornando 200
-
-### 6. README
-
-Substitua o conteúdo do `README.md` do repositório base pela documentação da sua entrega, com as seguintes seções:
-
-- Sobre a entrega: visão geral da solução em 1 a 2 parágrafos
-- Imagem no Docker Hub: link do repositório, comando `docker pull`, digest do manifest e comparação de tamanho entre a imagem `dev` e a imagem `production`
-- Decisões técnicas: justificativa da imagem base de produção com comparação a pelo menos 1 alternativa considerada, e explicação da estratégia de cache de build adotada
-- Como rodar (desenvolvimento): passo a passo, incluindo o uso do watch e do profile `tools`
-- Como rodar (produção): passo a passo
-- Segurança e supply chain: comandos para verificar usuário não-root, labels, SBOM e provenance; resumo do relatório do Scout e justificativa das CVEs remanescentes (HIGH, e CRITICAL sem correção disponível), se houver
-- Validação: mapeamento de cada critério de aceite ao comando que o avaliador executa para verificá-lo
-
-## Critérios de Aceite
-
-A entrega é avaliada contra os critérios abaixo. Todos são obrigatórios.
-
-Dockerfile e contexto de build
-
-☐ `Dockerfile` único na raiz com os estágios nomeados `dev`, `build` e `production`
-☐ Nenhuma imagem em `Dockerfile`, `compose.yaml` ou `compose.prod.yaml` usa tag `latest` ou omite a tag
-☐ `.dockerignore` presente, excluindo no mínimo `node_modules`, `dist`, `.git` e `.env`
-☐ Instalações de dependências usam `RUN --mount=type=cache`
-☐ `docker build --target dev .` e `docker build --target production .` concluem sem erro
-
-Ambiente de desenvolvimento
-
-☐ `cp .env.example .env && docker compose up` deixa a API respondendo em `http://localhost:3000` e `GET /flags` retorna 200 (migrações aplicadas), sem passos manuais adicionais
-☐ `db` possui healthcheck e `app` depende dele com `condition: service_healthy`
-☐ Com `docker compose watch` (ou `up --watch`), alteração em arquivo de `src/` é refletida sem rebuild e alteração no `package.json` dispara rebuild
-☐ `docker compose --profile tools up -d` sobe o cliente de banco em `http://localhost:8081`
-☐ `docker compose exec app id -u` retorna um UID diferente de 0
-☐ `.env` não está versionado e `.env.example` está, com valores funcionais
-
-Imagem de produção e Docker Hub
-
-☐ `docker buildx imagetools inspect` da imagem lista `linux/amd64` e `linux/arm64`
-☐ `docker buildx imagetools inspect` exibe as attestations de SBOM e provenance
-☐ A tag semver e a tag `latest` apontam para o mesmo digest
-☐ Após `docker pull --platform linux/amd64`, `docker image ls` reporta tamanho menor ou igual a 350 MB
-☐ `docker image inspect` mostra `User` não-root, `HEALTHCHECK` configurado e as 4 labels OCI exigidas
-☐ Com um banco acessível (ex: no ambiente de produção), o container fica `healthy` pelo `HEALTHCHECK` da própria imagem
-☐ `docker stop` encerra o container em menos de 10 segundos, sem esperar o timeout do SIGKILL
-
-Docker Scout
-
-☐ `reports/scout-cves.txt` contém a saída completa do `docker scout cves` da imagem publicada
-☐ Zero CVEs de severidade CRITICAL com correção disponível (`docker scout cves --only-severity critical --only-fixed`)
-☐ CVEs HIGH, e CRITICAL sem correção disponível, se existirem, estão listadas e justificadas no README
-
-Ambiente de produção
-
-☐ `compose.prod.yaml` não contém instrução `build` e referencia a imagem do Docker Hub pela tag semver
-☐ Os serviços `app` e `db` têm restart policy e limites de CPU e memória
-☐ Não há bind mount de código-fonte e os dados do PostgreSQL estão em volume nomeado
-☐ `cp .env.example .env && docker compose -f compose.prod.yaml up -d` deixa a API em `http://localhost:3000`, `GET /flags` retorna 200 e `ps` exibe `app` e `db` como `healthy`
-
-README
-
-☐ Contém todas as seções obrigatórias listadas no requisito 6
-☐ Inclui o link do repositório no Docker Hub e o comando `docker pull`
-☐ Justifica a escolha da imagem base de produção comparando com pelo menos 1 alternativa
-☐ A seção Validação mapeia os critérios de aceite aos comandos de verificação
-
-Consistência geral
-
-☐ O código da aplicação (`src/`, `package.json`, `package-lock.json`, `tsconfig.json`, migrações) não foi alterado
-☐ Nenhuma credencial hardcoded em `Dockerfile` ou nos arquivos compose (valores sempre vindos do `.env`); o único arquivo versionado com valores de credenciais é o `.env.example`, contendo exclusivamente credenciais de desenvolvimento local
-
-## Estrutura obrigatória do entregável
-
-```
-.
-├── Dockerfile
-├── .dockerignore
-├── compose.yaml
-├── compose.prod.yaml
-├── .env.example
-├── reports/
-│   └── scout-cves.txt
-├── src/                  (não alterar)
-├── package.json          (não alterar)
-├── package-lock.json     (não alterar)
-├── tsconfig.json         (não alterar)
-├── ...                   (demais arquivos da aplicação, não alterar)
-└── README.md             (substituído pelo aluno)
+```bash
+cp .env.example .env
+docker compose up
 ```
 
-Arquivos adicionais de containerização criados por você, como scripts de inicialização, podem ficar na raiz ou em uma pasta `docker/`.
+Isso sobe `db` (PostgreSQL com healthcheck), aplica as migrações automaticamente via serviço `migrate` (`condition: service_completed_successfully`) e só então inicia `app`. A API fica disponível em <http://localhost:3000> (`GET /flags` → 200).
 
-## Entregável
+**Hot reload com watch** (sync de `src/` sem rebuild, rebuild automático se `package.json` mudar):
 
-- Repositório público no GitHub, fork do repositório base, com todo o conteúdo na branch `main`
-- Repositório público no Docker Hub com a imagem de produção, com o link e o comando `docker pull` no README
+```bash
+docker compose watch
+# ou: docker compose up --watch
+```
 
-## Repositório base
+**Cliente de administração do banco** (Adminer), somente sob demanda via profile `tools`:
 
-https://github.com/devfullcycle/fc4-desafio-docker-node-api
+```bash
+docker compose --profile tools up -d
+# http://localhost:8081 — Sistema: PostgreSQL, Servidor: db, Usuário/senha/banco: valores do .env
+```
 
-## Ordem de execução sugerida
+Verificar que o processo da aplicação não roda como root:
 
-**1.** Fork e exploração: leia os scripts do `package.json`, entenda as variáveis de ambiente esperadas e o funcionamento do `db:migrate`.
+```bash
+docker compose exec app id -u   # retorna 1000 (usuário "node")
+```
 
-**2.** Crie o `.dockerignore` e o estágio `dev` do Dockerfile.
+## Como rodar (produção)
 
-**3.** Monte o `compose.yaml` mínimo (app + db com healthcheck e migrações automáticas) até a API responder em `http://localhost:3000`.
+```bash
+cp .env.example .env
+docker compose -f compose.prod.yaml up -d
+```
 
-**4.** Adicione o `develop.watch` e o serviço de administração de banco sob o profile `tools`.
+`compose.prod.yaml` não contém nenhuma instrução `build`: `app` e `migrate` usam a imagem já publicada `brito101/fc4-flags-api:1.0.0`. O serviço `migrate` roda a migração (`node dist/db/migrate.js`) e finaliza antes de `app` iniciar; `app` e `db` têm `restart: unless-stopped` e limites de CPU/memória; não há bind mount de código-fonte e os dados do Postgres ficam no volume nomeado `fc4-flags-db-data-prod`.
 
-**5.** Escreva os estágios `build` e `production` e valide localmente com `docker build --target production .`.
+```bash
+docker compose -f compose.prod.yaml ps
+# app e db devem aparecer como "healthy"
 
-**6.** Crie o builder multi-plataforma no Buildx e faça o build com SBOM e provenance, publicando as duas tags no Docker Hub.
+curl -i http://localhost:3000/flags   # 200
+```
 
-**7.** Rode o Scout contra a imagem publicada. Se houver CVE CRITICAL com correção disponível, ajuste a imagem base e republique. Salve o relatório em `reports/`.
+## Segurança e supply chain
 
-**8.** Monte o `compose.prod.yaml` consumindo a imagem publicada, incluindo a aplicação automática das migrações.
+```bash
+# Usuário não-root (a imagem já roda como uid 65532 por padrão da base distroless "nonroot")
+docker image inspect brito101/fc4-flags-api:1.0.0 --format '{{.Config.User}}'
 
-**9.** Escreva o README com as evidências e a seção de validação.
+# Labels OCI exigidas
+docker image inspect brito101/fc4-flags-api:1.0.0 --format '{{json .Config.Labels}}'
 
-**10.** Revisão final: percorra a checklist de critérios de aceite item por item antes do push final.
+# HEALTHCHECK declarado na imagem
+docker image inspect brito101/fc4-flags-api:1.0.0 --format '{{json .Config.Healthcheck}}'
 
-## Dicas finais
+# Plataformas, SBOM e provenance publicados junto da imagem
+docker buildx imagetools inspect brito101/fc4-flags-api:1.0.0
 
-A ordem das instruções no Dockerfile determina o aproveitamento de cache. Copiar o `package.json` e o lockfile antes do restante do código muda drasticamente o tempo de rebuild durante o desenvolvimento.
+# Encerramento gracioso: para em menos de 10s, sem aguardar o SIGKILL
+time docker stop <container>
+```
 
-O tamanho da imagem final é consequência das suas decisões (imagem base, multi-stage, apenas dependências de produção), não de um ajuste cosmético no fim. Se a imagem estourou o limite, revisite as decisões.
+### Resumo do Docker Scout
 
-O `HEALTHCHECK` executa dentro da imagem final: bases enxutas nem sempre trazem `curl` ou `wget`, mas o próprio `node` (com o `fetch` global) resolve.
+Relatório completo em [`reports/scout-cves.txt`](reports/scout-cves.txt) (`docker scout cves brito101/fc4-flags-api:1.0.0`):
 
-Se o Scout apontar CVEs CRITICAL com correção disponível, o caminho quase sempre é atualizar ou trocar a imagem base, não conviver com elas.
+```text
+vulnerabilities │ 0C  0H  1M  11L  21?
+```
 
-`docker buildx imagetools inspect` é a ferramenta para conferir plataformas, digests e attestations de uma imagem publicada sem precisar puxá-la.
+- **0 CRITICAL, 0 HIGH.** Não há CVEs HIGH nem CRITICAL sem correção a justificar — a única CVE CRITICAL detectada durante o desenvolvimento (CVE-2025-55130, no runtime Node embutido na tag distroless `nodejs22-debian12`) foi eliminada trocando a fonte do binário do Node para `node:22.22.2-bookworm-slim` (ver [Decisões técnicas](#decisões-técnicas)); confirmado com:
 
-Teste o fluxo do avaliador do zero: clone o seu próprio fork em uma pasta limpa, copie o `.env.example` e execute exatamente os comandos descritos no README. Se qualquer passo extra for necessário, o critério não está atendido.
+  ```bash
+  docker scout cves --only-severity critical --only-fixed brito101/fc4-flags-api:1.0.0
+  # ✓ 0 vulnerabilities found
+  ```
+
+- 1 MEDIUM (`CVE-2026-6791`, `glibc`) e 11 LOW, todas **sem correção disponível** na Debian 12 no momento do build (`Fixed version: not fixed`) — abaixo do limiar (HIGH/CRITICAL) que o desafio exige justificar, mantidas apenas como acompanhamento: futuras republicações da imagem (`docker buildx build --pull ...`) absorvem o patch assim que o Debian o disponibilizar, sem qualquer mudança de código.
+
+## Validação
+
+| Critério de aceite | Comando de verificação |
+|---|---|
+| Dockerfile único com estágios `dev`, `build`, `production` | `grep -E '^FROM .* AS (dev\|build\|production)' Dockerfile` |
+| Nenhuma imagem com `latest`/sem tag | inspeção manual de `Dockerfile`, `compose.yaml`, `compose.prod.yaml` (todas as tags são fixadas) |
+| `.dockerignore` exclui `node_modules`, `dist`, `.git`, `.env` | `cat .dockerignore` |
+| `npm ci` usa cache de build | `grep -A1 'npm ci' Dockerfile` (`RUN --mount=type=cache,...`) |
+| `docker build --target dev .` / `--target production .` concluem sem erro | `docker build --target dev . && docker build --target production .` |
+| `cp .env.example .env && docker compose up` deixa API em `:3000`, `/flags` → 200 | `cp .env.example .env && docker compose up -d && curl -i http://localhost:3000/flags` |
+| `db` com healthcheck, `app` com `condition: service_healthy` | `grep -A5 'healthcheck' compose.yaml`; `docker compose ps` |
+| `docker compose watch`: sync em `src/`, rebuild em `package.json` | `docker compose watch` + editar `src/app.ts` (sync) e `package.json` (rebuild) |
+| `docker compose --profile tools up -d` sobe Adminer em `:8081` | `docker compose --profile tools up -d && curl -I http://localhost:8081` |
+| `docker compose exec app id -u` ≠ 0 | `docker compose exec app id -u` |
+| `.env` fora do versionamento, `.env.example` versionado e funcional | `git check-ignore .env`; `cat .env.example` |
+| `imagetools inspect` lista `linux/amd64` e `linux/arm64` | `docker buildx imagetools inspect brito101/fc4-flags-api:1.0.0` |
+| `imagetools inspect` exibe attestations de SBOM e provenance | `docker buildx imagetools inspect brito101/fc4-flags-api:1.0.0 --format '{{json .SBOM}}'` / `--format '{{json .Provenance}}'` |
+| Tag semver e `latest` apontam para o mesmo digest | `docker buildx imagetools inspect brito101/fc4-flags-api:1.0.0` vs `...:latest` (mesmo `Digest:`) |
+| Tamanho ≤ 350 MB após `docker pull --platform linux/amd64` | `docker pull --platform linux/amd64 brito101/fc4-flags-api:1.0.0 && docker image ls brito101/fc4-flags-api` |
+| `User` não-root, `HEALTHCHECK` e 4 labels OCI | `docker image inspect brito101/fc4-flags-api:1.0.0 --format '{{.Config.User}} {{json .Config.Healthcheck}} {{json .Config.Labels}}'` |
+| Container fica `healthy` com banco acessível | `docker compose -f compose.prod.yaml up -d && docker compose -f compose.prod.yaml ps` |
+| `docker stop` encerra em < 10s | `time docker stop <container>` |
+| `reports/scout-cves.txt` com saída completa do Scout | `cat reports/scout-cves.txt` |
+| Zero CRITICAL com correção disponível | `docker scout cves --only-severity critical --only-fixed brito101/fc4-flags-api:1.0.0` |
+| CVEs HIGH/CRITICAL-sem-fix justificadas no README | seção [Segurança e supply chain](#segurança-e-supply-chain) (nenhuma encontrada) |
+| `compose.prod.yaml` sem `build`, usa imagem pela tag semver | `grep -c 'build:' compose.prod.yaml` (0); `grep image: compose.prod.yaml` |
+| `app`/`db` com restart policy e limites de CPU/memória | `docker inspect fc4-flags-api-prod-app-1 --format '{{.HostConfig.RestartPolicy.Name}} {{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}'` |
+| Sem bind mount de código; dados do Postgres em volume nomeado | `docker inspect fc4-flags-api-prod-db-1 --format '{{json .Mounts}}'` |
+| `cp .env.example .env && docker compose -f compose.prod.yaml up -d` → API em `:3000`, `/flags` → 200, `ps` mostra `healthy` | `cp .env.example .env && docker compose -f compose.prod.yaml up -d && curl -i http://localhost:3000/flags && docker compose -f compose.prod.yaml ps` |
+| Código da aplicação não alterado | `git diff upstream/main -- src/ package.json package-lock.json tsconfig.json` (sem diferenças) |
+| Nenhuma credencial hardcoded fora do `.env.example` | `grep -RniE 'password\|secret' Dockerfile compose.yaml compose.prod.yaml` (nenhum valor fixo, apenas `${VAR}`) |

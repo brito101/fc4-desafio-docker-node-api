@@ -1,0 +1,66 @@
+name: fc4-flags-api-prod
+
+networks:
+  fc4-net:
+    name: fc4-flags-net-prod
+
+volumes:
+  db-data:
+    name: fc4-flags-db-data-prod
+
+services:
+  db:
+    image: postgres:17.6-bookworm
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    networks:
+      - fc4-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  migrate:
+    image: brito101/fc4-flags-api:1.0.0
+    env_file:
+      - .env
+    command: ["dist/db/migrate.js"]
+    networks:
+      - fc4-net
+    depends_on:
+      db:
+        condition: service_healthy
+
+  app:
+    image: brito101/fc4-flags-api:1.0.0
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${PORT:-3000}:3000"
+    networks:
+      - fc4-net
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
