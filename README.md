@@ -1,12 +1,12 @@
-# fc4-flags-api — Containerização (Do Dev à Produção)
+# fc4-flags-api - Containerização (Do Dev à Produção)
 
-Entrega do desafio **"Do Dev à Produção: Containerizando uma API Node.js"** da Full Cycle 4.0 (trilha Docker para Produção). O código da aplicação (`src/`, `package.json`, `package-lock.json`, `tsconfig.json`, migrações) não foi alterado — a entrega é puramente a camada de containers.
+Entrega do desafio **"Do Dev à Produção: Containerizando uma API Node.js"** da Full Cycle 4.0 (trilha Docker para Produção). O código da aplicação (`src/`, `package.json`, `package-lock.json`, `tsconfig.json`, migrações) não foi alterado - a entrega é puramente a camada de containers.
 
 ## Sobre a entrega
 
 A API de feature flags (Node.js + TypeScript + PostgreSQL) ganhou dois ambientes de container totalmente automatizados a partir de um único `Dockerfile` multi-stage. O ambiente de **desenvolvimento** roda a partir do código-fonte com `tsx watch`, hot-sync/rebuild via `docker compose watch` e um cliente de banco (Adminer) sob demanda. O ambiente de **produção** consome uma imagem já compilada, publicada multi-arch (amd64/arm64) no Docker Hub com SBOM e provenance assinados, rodando sobre uma base distroless sem shell nem gerenciador de pacotes.
 
-Em ambos os ambientes as migrações do banco (`dist/db/migrate.js` / `npm run db:migrate`) são aplicadas por um serviço `migrate` de execução única, orquestrado pelo Compose via `depends_on: condition: service_completed_successfully` — nenhum passo manual é necessário além de `cp .env.example .env` e o `up`.
+Em ambos os ambientes as migrações do banco (`dist/db/migrate.js` / `npm run db:migrate`) são aplicadas por um serviço `migrate` de execução única, orquestrado pelo Compose via `depends_on: condition: service_completed_successfully` - nenhum passo manual é necessário além de `cp .env.example .env` e o `up`.
 
 ## Imagem no Docker Hub
 
@@ -23,7 +23,7 @@ Comparação de tamanho (`docker image ls` após `docker pull`, plataforma `linu
 | `fc4-flags-api:dev` (estágio dev)      |     ~455 MB |       ~106 MB |
 | `brito101/fc4-flags-api:1.0.0` (prod)  |     ~214 MB |        ~56 MB |
 
-A imagem de produção é cerca de **2x menor** que a de dev — sem devDependencies, sem TypeScript/tsx, sem toolchain de build e sobre uma base sem shell/gerenciador de pacotes, bem abaixo do limite de 350 MB exigido.
+A imagem de produção é cerca de **2x menor** que a de dev - sem devDependencies, sem TypeScript/tsx, sem toolchain de build e sobre uma base sem shell/gerenciador de pacotes, bem abaixo do limite de 350 MB exigido.
 
 ## Decisões técnicas
 
@@ -31,14 +31,14 @@ A imagem de produção é cerca de **2x menor** que a de dev — sem devDependen
 
 Escolhida uma composição **distroless** (`gcr.io/distroless/cc-debian12:nonroot`, ~20 MB) com o binário oficial do Node.js copiado de `node:22.22.2-bookworm-slim` por cima (estágio `node-runtime`), em vez de usar diretamente as tags prontas `gcr.io/distroless/nodejs22-debian12`.
 
-Motivo: ao rodar `docker scout cves` contra a tag `nodejs22-debian12:nonroot`, o Node embutido nela (22.22.0) continha a CVE crítica **CVE-2025-55130** (corrigida em 22.22.2), e a tag distroless ainda não havia sido republicada com o patch. Como a imagem `cc-debian12` já fornece exatamente as bibliotecas dinâmicas de que o binário do Node depende (`libc`, `libstdc++`, `libgcc`, `libm`, `libdl`, `libpthread` — verificado com `ldd`), copiar o Node de uma tag oficial já patcheada resolve a CVE sem abrir mão da superfície mínima do distroless (sem shell, sem `apt`/`apk`, usuário não-root nativo).
+Motivo: ao rodar `docker scout cves` contra a tag `nodejs22-debian12:nonroot`, o Node embutido nela (22.22.0) continha a CVE crítica **CVE-2025-55130** (corrigida em 22.22.2), e a tag distroless ainda não havia sido republicada com o patch. Como a imagem `cc-debian12` já fornece exatamente as bibliotecas dinâmicas de que o binário do Node depende (`libc`, `libstdc++`, `libgcc`, `libm`, `libdl`, `libpthread` - verificado com `ldd`), copiar o Node de uma tag oficial já patcheada resolve a CVE sem abrir mão da superfície mínima do distroless (sem shell, sem `apt`/`apk`, usuário não-root nativo).
 
-**Alternativa considerada e descartada:** `node:22-alpine`. Prós: menor esforço (nenhuma montagem manual de binário), boa maturidade/documentação, `apk` disponível para depuração. Contras decisivos para este caso: (1) traz um shell e um gerenciador de pacotes completos na imagem final, ampliando a superfície de ataque que o desafio pede para minimizar; (2) a base Alpine tem seu próprio histórico de CVEs em `busybox`/`musl`/`openssl` que precisariam ser monitorados à parte; (3) o tamanho final (~180 MB só de base) fica mais próximo do limite de 350 MB do que a composição distroless usada (~20 MB de base). A composição distroless entrega superfície de ataque menor e imagem menor, ao custo de exigir o estágio extra `node-runtime` — trade-off considerado favorável para produção.
+**Alternativa considerada e descartada:** `node:22-alpine`. Prós: menor esforço (nenhuma montagem manual de binário), boa maturidade/documentação, `apk` disponível para depuração. Contras decisivos para este caso: (1) traz um shell e um gerenciador de pacotes completos na imagem final, ampliando a superfície de ataque que o desafio pede para minimizar; (2) a base Alpine tem seu próprio histórico de CVEs em `busybox`/`musl`/`openssl` que precisariam ser monitorados à parte; (3) o tamanho final (~180 MB só de base) fica mais próximo do limite de 350 MB do que a composição distroless usada (~20 MB de base). A composição distroless entrega superfície de ataque menor e imagem menor, ao custo de exigir o estágio extra `node-runtime` - trade-off considerado favorável para produção.
 
 ### Estratégia de cache de build
 
-- `RUN --mount=type=cache,target=/root/.npm` em todo `npm ci`, para os estágios `dev`, `build` e `prod-deps` — o cache do npm persiste entre builds mesmo quando a camada é invalidada, evitando novo download de pacotes da rede.
-- Estágio `base` compartilhado copia **apenas** `package.json` e `package-lock.json` antes de qualquer outra instrução. Como o restante do código (`COPY . .`) só acontece depois do `npm ci`, alterar um arquivo em `src/` nunca invalida a camada de instalação de dependências — só uma mudança no `package.json`/lockfile dispara reinstalação.
+- `RUN --mount=type=cache,target=/root/.npm` em todo `npm ci`, para os estágios `dev`, `build` e `prod-deps` - o cache do npm persiste entre builds mesmo quando a camada é invalidada, evitando novo download de pacotes da rede.
+- Estágio `base` compartilhado copia **apenas** `package.json` e `package-lock.json` antes de qualquer outra instrução. Como o restante do código (`COPY . .`) só acontece depois do `npm ci`, alterar um arquivo em `src/` nunca invalida a camada de instalação de dependências - só uma mudança no `package.json`/lockfile dispara reinstalação.
 - `prod-deps` roda `npm ci --omit=dev` isolado do estágio `build` (que precisa de `devDependencies` para compilar), então a imagem de produção nunca herda camadas com dependências de desenvolvimento.
 - O estágio `node-runtime` e o `base` ficam completamente desacoplados: o Buildx só refaz o download da imagem `node:22.22.2-bookworm-slim` se o `ARG NODE_RUNTIME_VERSION` mudar.
 
@@ -62,7 +62,7 @@ docker compose watch
 
 ```bash
 docker compose --profile tools up -d
-# http://localhost:8081 — Sistema: PostgreSQL, Servidor: db, Usuário/senha/banco: valores do .env
+# http://localhost:8081 - Sistema: PostgreSQL, Servidor: db, Usuário/senha/banco: valores do .env
 ```
 
 Verificar que o processo da aplicação não roda como root:
@@ -114,14 +114,14 @@ Relatório completo em [`reports/scout-cves.txt`](reports/scout-cves.txt) (`dock
 vulnerabilities │ 0C  0H  1M  11L  21?
 ```
 
-- **0 CRITICAL, 0 HIGH.** Não há CVEs HIGH nem CRITICAL sem correção a justificar — a única CVE CRITICAL detectada durante o desenvolvimento (CVE-2025-55130, no runtime Node embutido na tag distroless `nodejs22-debian12`) foi eliminada trocando a fonte do binário do Node para `node:22.22.2-bookworm-slim` (ver [Decisões técnicas](#decisões-técnicas)); confirmado com:
+- **0 CRITICAL, 0 HIGH.** Não há CVEs HIGH nem CRITICAL sem correção a justificar - a única CVE CRITICAL detectada durante o desenvolvimento (CVE-2025-55130, no runtime Node embutido na tag distroless `nodejs22-debian12`) foi eliminada trocando a fonte do binário do Node para `node:22.22.2-bookworm-slim` (ver [Decisões técnicas](#decisões-técnicas)); confirmado com:
 
   ```bash
   docker scout cves --only-severity critical --only-fixed brito101/fc4-flags-api:1.0.0
   # ✓ 0 vulnerabilities found
   ```
 
-- 1 MEDIUM (`CVE-2026-6791`, `glibc`) e 11 LOW, todas **sem correção disponível** na Debian 12 no momento do build (`Fixed version: not fixed`) — abaixo do limiar (HIGH/CRITICAL) que o desafio exige justificar, mantidas apenas como acompanhamento: futuras republicações da imagem (`docker buildx build --pull ...`) absorvem o patch assim que o Debian o disponibilizar, sem qualquer mudança de código.
+- 1 MEDIUM (`CVE-2026-6791`, `glibc`) e 11 LOW, todas **sem correção disponível** na Debian 12 no momento do build (`Fixed version: not fixed`) - abaixo do limiar (HIGH/CRITICAL) que o desafio exige justificar, mantidas apenas como acompanhamento: futuras republicações da imagem (`docker buildx build --pull ...`) absorvem o patch assim que o Debian o disponibilizar, sem qualquer mudança de código.
 
 ## Validação
 
